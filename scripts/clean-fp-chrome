@@ -1,0 +1,90 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# clean-fp-chrome — launch a Turnstile-grade Chromium on Termux.
+#
+# WHY THIS EXISTS (proven 2026-11-20, app.anoman.io production Turnstile):
+#   headless_shell with low-end flags  -> navigator.webdriver=true, UA "HeadlessChrome",
+#                                         interactive challenge ALWAYS fails verification
+#   chrome --headless=new + clean args -> challenge DOWNGRADES to non-interactive,
+#                                         token auto-lands in ~9 s, zero clicks
+#
+# The difference is not the skill or the script — it is how the browser process is born.
+# Cloudflare reads signals INSIDE the challenge iframe (OOPIF); patching the parent
+# page's navigator does nothing. Fix it at launch or not at all.
+#
+# Usage:
+#   clean-fp-chrome                     # spawn on :9222 with profile-clean
+#   clean-fp-chrome --profile gui       # spawn with a named profile (e.g. profile-gui = saved logins)
+#   clean-fp-chrome --check             # verify a running browser's fingerprint via CDP
+#   clean-fp-chrome --kill              # stop it
+#
+# Profiles:
+#   profile-clean : fresh working profile (no logins)
+#   profile-gui   : saved session logins (e.g. Anoman dashboard)
+#   any other name: created fresh on first spawn
+
+PORT=9222
+BIN="/data/data/com.termux/files/usr/lib/chromium/chrome"
+UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36'
+
+PROFILE_NAME="clean"
+if [ "${1:-}" = "--profile" ] && [ -n "${2:-}" ]; then
+  PROFILE_NAME="$2"; shift 2
+fi
+PROFILE="$HOME/.cache/hermes-browser/profile-$PROFILE_NAME"
+
+case "${1:-}" in
+  --kill)
+    pkill -f "remote-debugging-port=$PORT" 2>/dev/null
+    sleep 1
+    pgrep -f "remote-debugging-port=$PORT" >/dev/null && echo "still running" || echo "killed"
+    exit 0 ;;
+esac
+
+if [ "${1:-}" = "--check" ]; then
+  # fingerprint audit of the browser currently on $PORT
+  VER=$(curl -s -m 5 "http://127.0.0.1:$PORT/json/version")
+  echo "$VER" | grep -q Browser || { echo "FAIL: no browser on :$PORT"; exit 1; }
+  echo "$VER" | grep -q '"Browser": "Chrome/' && echo "PASS  UA: real Chrome (not HeadlessChrome)" \
+                                                  || { echo "FAIL  UA: $(echo "$VER" | grep Browser)"; }
+  echo "$VER" | grep -q HeadlessChrome && echo "FAIL  UA contains HeadlessChrome" || true
+  curl -s -m 5 "http://127.0.0.1:$PORT/json/new?about:blank" -X PUT >/dev/null 2>&1
+  TID=$(curl -s -m 5 "http://127.0.0.1:$PORT/json/list" | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['id'])" 2>/dev/null)
+  RES=$(curl -s -m 5 "http://127.0.0.1:$PORT/json/runtime/evaluate" -X POST -H 'content-type: application/json' \
+        -d "{\"targetId\":\"$TID\",\"expression\":\"JSON.stringify({wd:navigator.webdriver,ua:navigator.userAgent.includes('Headless'),pl:navigator.plugins.length})\"}" 2>/dev/null)
+  # Fallback: the /json/runtime endpoint may not exist on this build; report what we know.
+  echo "detail: $RES"
+  echo "Manual verify (any CDP client): navigator.webdriver must be false."
+  exit 0
+fi
+
+# ---- spawn ----
+if curl -s -m 2 "http://127.0.0.1:$PORT/json/version" | grep -q Browser; then
+  echo "browser already running on :$PORT — kill first: clean-fp-chrome --kill"
+  exit 1
+fi
+
+mkdir -p "$PROFILE"
+nohup "$BIN" \
+  --headless=new \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=$PORT \
+  --user-data-dir="$PROFILE" \
+  --user-agent="$UA" \
+  --window-size=800,600 \
+  --disable-blink-features=AutomationControlled \
+  about:blank >"$HOME/.cache/hermes-browser/chrome-clean.log" 2>&1 &
+
+# wait for CDP (max 15 s)
+for i in $(seq 1 15); do
+  sleep 1
+  curl -s -m 2 "http://127.0.0.1:$PORT/json/version" | grep -q Browser && {
+    echo "UP  pid=$! port=$PORT profile=profile-$PROFILE_NAME"
+    echo "next: fp-audit $PORT"
+    exit 0
+  }
+done
+echo "FAILED to start — log: ~/.cache/hermes-browser/chrome-clean.log"
+tail -5 "$HOME/.cache/hermes-browser/chrome-clean.log"
+exit 1
