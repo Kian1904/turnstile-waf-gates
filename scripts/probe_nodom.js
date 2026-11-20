@@ -1,11 +1,18 @@
 // Probe: can Turnstile token be produced WITHOUT a browser?
 // Loads the real api.js (already downloaded) in bare Node and in jsdom.
 const fs = require('fs');
-const path = 'api.js';
+const path = require('path');
+const apiPath = process.env.TURNSTILE_API_JS || path.join(__dirname, 'api.js');
+const sourceAvailable = fs.existsSync(apiPath);
+const sourceMissingMessage = 'api.js is not present; download it first with: curl -fsSL https://challenges.cloudflare.com/turnstile/v0/api.js -o scripts/api.js';
 
 function probeA() {
   console.log('=== PROBE A: bare Node (no DOM) ===');
-  const src = fs.readFileSync(path, 'utf8');
+  if (!sourceAvailable) {
+    console.log('  SKIP:', sourceMissingMessage);
+    return { skipped: true, survived: false };
+  }
+  const src = fs.readFileSync(apiPath, 'utf8');
   const sandbox = {}; // globalThis
   try {
     // api.js expects a browser global scope; give it the real one to see how far it gets
@@ -21,6 +28,10 @@ function probeA() {
 
 function probeB() {
   console.log('\n=== PROBE B: jsdom (DOM but no real browser) ===');
+  if (!sourceAvailable) {
+    console.log('  SKIP:', sourceMissingMessage);
+    return { available: false, skipped: true };
+  }
   let JSDOM;
   try {
     ({ JSDOM } = require('jsdom'));
@@ -35,7 +46,7 @@ function probeB() {
     resources: 'usable',
     pretendToBeVisual: true,
   });
-  const src = fs.readFileSync(path, 'utf8');
+  const src = fs.readFileSync(apiPath, 'utf8');
   try {
     dom.window.eval(src);
     console.log('  api.js loaded into jsdom');
@@ -52,6 +63,12 @@ function probeB() {
 
 const a = probeA();
 const b = probeB();
+
+if (!sourceAvailable) {
+  console.log('\n=== VERDICT ===');
+  console.log('SKIPPED: real api.js fixture is absent; no claim about DOM execution was made.');
+  process.exit(2);
+}
 
 console.log('\n=== VERDICT ===');
 if (!a.survived && (!b.available || !b.loaded)) {

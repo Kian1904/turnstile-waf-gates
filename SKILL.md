@@ -84,6 +84,52 @@ Note `chrome` the full binary, NOT `headless_shell` — same package, different 
 
 ## Aliyun/Ncaptcha sliders are a different family — use `browser-captcha-solving` (widget DOM, gray-veil hole detection, `F000`/`F015` codes) and `qwen-baxia-captcha` for the baxia grid.
 
+## hCaptcha: same browser primitive, different widget contract
+
+hCaptcha is not Turnstile with a different sitekey. Triage it separately:
+
+| Signature | Meaning | Correct next step |
+|---|---|---|
+| `h-captcha` / `hcaptcha.render` / `js.hcaptcha.com/1/api.js` | hCaptcha widget | use the hCaptcha callback/response field; do not search for `cf-turnstile-response` |
+| `hcaptcha-response` present but empty | widget mounted, no proof yet | wait for callback or a visible challenge; empty field is not a failure verdict |
+| `h-captcha-response` plus server `success:false` | proof rejected/expired/consumed | parse `siteverify` JSON; mint a fresh proof |
+| no widget, only an application error | not enough evidence to blame hCaptcha | inspect network and the application response first |
+
+The browser-side contract is:
+
+```js
+hcaptcha.render(container, {
+  sitekey,
+  callback: token => { /* submit token exactly once */ },
+  'expired-callback': () => { /* mint again */ },
+  'error-callback': err => { /* record the error, do not claim solved */ }
+})
+```
+
+Use the official hCaptcha test key only in an integration test. It always passes and
+therefore proves wiring, callback handling, and server-side parsing — **not** anti-bot
+effectiveness. Production challenge testing requires a sitekey and a target the tester
+is authorized to operate. Never add a third-party solver or claim a production solve
+from a screenshot alone.
+
+### Vision-assisted interactive challenge (authorized test environments only)
+
+When a real challenge visibly renders and manual assistance is allowed, the safe
+closed loop is: capture the challenge screenshot → identify the requested object and
+tile coordinates → click only the requested tiles → wait for the widget callback →
+verify the application's response body. Do not infer success from `"verify"`, green
+UI, or challenge text. Keep the screenshot and token in memory only; do not persist
+credentials or challenge responses.
+
+The coordinate solver must refuse to act when the screenshot is ambiguous, the widget
+is still loading, the challenge asks for an interaction it cannot identify reliably, or
+the server response is unavailable. A vision model can select coordinates; it cannot
+prove that the server accepted the proof.
+
+Reference: hCaptcha's official developer guide documents `hcaptcha.render`, callbacks,
+test keys, and the single-use token rule. The repository's `scripts/test_hcaptcha_logic.py`
+tests the classifier and callback/response-field rules without solving a live challenge.
+
 ## Choosing a path without a browser
 
 Measured on-device (2026-11-19). This is the honest boundary:

@@ -16,6 +16,7 @@ scripts/
   test_turnstile_logic.py     — 23 checks: classifier + sitekey/action/cData extraction
   test_live_triage.py         — 8 live-site checks (TLS only, no browser)
   test_replay_path.py         — 12 checks: token binding rules on a mock gate
+  test_hcaptcha_logic.py      — offline hCaptcha routing/verdict checks
   probe_nodom.js              — proves api.js requires a DOM (bare Node throws)
 ```
 
@@ -29,6 +30,16 @@ scripts/
 | `chrome --headless=new` + clean UA + `--disable-blink-features=AutomationControlled` | challenge **downgrades to non-interactive** — token auto-lands in ~9 s, zero clicks |
 
 Same sitekey, same script, same click logic. Only the process birth changed. Patching `navigator.webdriver` on the parent page does **nothing** — the challenge runs in an OOPIF with its own JS context. Fix the fingerprint at launch or not at all.
+
+## hCaptcha expansion
+
+hCaptcha is covered as a separate widget family: `h-captcha`, `hcaptcha.render`,
+`hcaptcha-response`, callback/expiry/error handling, and server-side JSON verdicts.
+The official always-pass test key is suitable for integration wiring only; it does not
+test production anti-bot behavior. The skill also documents a conservative,
+authorized-only vision-assisted workflow for visible challenges: screenshot → explicit
+tile coordinates → trusted clicks → server response verification. It does not ship a
+third-party solver or treat green UI/page text as proof of success.
 
 ## Quick start
 
@@ -50,6 +61,7 @@ Run the self-tests (no browser needed for three of four):
 
 ```bash
 python3 scripts/test_replay_path.py        # 12/12 — token binding rules
+python3 scripts/test_hcaptcha_logic.py    # offline hCaptcha routing/verdict rules
 node scripts/probe_nodom.js                # DOM requirement proof
 # test_turnstile_logic.py & test_live_triage.py need curl_cffi (see SKILL.md)
 ```
