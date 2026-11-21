@@ -260,6 +260,49 @@ Before debugging any solver, check whether the target is reachable at all:
 - `borys25ol/amazon-location-cookies-service` (48★) — Amazon-specific wrapper around Playwright; only useful for the delivery-country cookie use case.
 - `0xMissy22/captcha-solver-global` (11★) — reCAPTCHA/hCaptcha/Turnstile behind a Bearer-authed service on `:8877`; needs `cloakbrowser` (commercial) + Xvfb + systemd.
 
+## Full-provider verdict matrix (verified 2026-11-21, Termux headless_shell Chrome/155, Indonesian mobile egress)
+
+Every row below was mechanically executed, not inferred. Use it to set expectations before spending time on a provider.
+
+| Provider | Path | Result |
+|---|---|---|
+| Turnstile dummy keys (`1x…AA`, siteverify) | curl siteverify | ✅ **PASS** — deterministic, IP-agnostic |
+| Turnstile interactive `3x…FF` | widget in headless | ❌ **BLOCKED** — err `300030` (fingerprint, not IP; UA + UA-CH spoof fails) |
+| hCaptcha test keys (`10000000-ffff…0001` + secret `0x000…`) | widget headless + siteverify | ✅ **FULL PASS** — token lands in hidden field `h-captcha-response`, verify `success:true` |
+| AWS WAF CAPTCHA (officeworks.com.au) | headless, puzzle solved via CDP | ✅ **PASS** — challenge JS runs, `aws-waf-token` set, verify 200, CLEAR. Needs solve < ~30 s time limit |
+| Arkose (cap.guru demo → snap-api.arkoselabs.com) | headless **and** headed Xvfb | ❌ **DENIED ACCESS** — `POST /fc/gt2/public_key/` → `400 {"error":"DENIED ACCESS"}` in BOTH modes. Axis is fingerprint environment (WebGL/GPU or IP), not headless-only |
+
+### Datacenter-IP replication (verified 2026-11-21, Instabox VM, Debian 13 x86_64, Chromium 154 headless + headed Xvfb, IP `152.236.28.27` US Latitude.sh `hosting=true`)
+
+| Test | Result on datacenter IP |
+|---|---|
+| Turnstile siteverify dummy keys | ✅ **PASS** — same as Termux, IP-agnostic |
+| hCaptcha siteverify (3 keysets) | ✅ **PASS** (publisher + enterprise safe, `scoped_uid` returned) |
+| Turnstile `3x…FF` widget (headless) | ❌ **BLOCKED** — null token, `ev []` (same as Termux) |
+| Arkose demo (headless & headed Xvfb) | ❌ **BLOCKED EARLIER** — `gt2` init is **never sent** (0 requests); frame log shows `error: Failed to load resource: 400`. Arkose flags the datacenter IP **before** the challenge flow starts — harder than on mobile IP |
+
+**Key datacenter finding:** on the VM, `gt2` never appears in the frame network log at all (not a 400-with-body like Termux — the request is killed earlier). Arkose's wall is IP reputation first, environment second.
+
+**VM replication recipe:** resume via MCP `resume_machine`, spawn chromium `--headless=new --remote-debugging-port=9222` (on Chrome 154 without `--remote-allow-origins`, `/json/new?URL` PUT still works). Node 22 built-in WebSocket for CDP. Xvfb preinstalled at `/usr/bin/Xvfb`. Kill all chromium + `rm /tmp/*.mjs` when done, then suspend the VM.
+
+## AWS WAF CAPTCHA solve pattern (the one that worked live)
+
+Distinct from the pure-crypto `aws-waf-token` reverse above — this is the **interactive CAPTCHA** variant, solved in a real headless browser:
+
+1. `curl -si https://target/` → `405` + `x-amzn-waf-action: captcha` confirms AWS WAF CAPTCHA is live (`202` = challenge interstitial).
+2. Open in headless → challenge JS auto-runs → click **Begin** via DOM (`document.querySelectorAll('button').find(b => b.innerText === 'Begin').click()`).
+3. Puzzle grid: `button.amzn-grid-cell` (3×3). Instruction is in the body text ("Choose all the X").
+4. **Time limit ~30 s from puzzle render** — the loop must be ONE pull: screenshot (`Page.captureScreenshot`) → visual classify (cells 1-9 row-by-row → index 0-8) → click cells → click Confirm. All within <10 s total.
+5. Submit → `POST <hash>.captcha.awswaf.com/<…>/verify` → 200. Wrong answer = new puzzle (retry is fine, not a ban). Late = "Time limit exceeded". Persistent error after a correct answer = check the network (submit may have failed, "Temporary error").
+6. Success = title changes from "Let's confirm you are human" → real page (or a CloudFront 403 from a *different* rule — separate layer, CAPTCHA still cleared).
+
+## Official test-key endpoints
+
+- **Turnstile:** `developers.cloudflare.com/turnstile/troubleshooting/testing` (`1x…AA` pass, `2x…AB` fail, `3x…FF` interactive, secret `1x/2x/3x…AA`)
+- **hCaptcha:** sitekey `10000000-ffff-ffff-ffff-000000000001` (publisher pass), `20000000…0002` (enterprise safe), `30000000…0003` (enterprise bot), secret `0x0000000000000000000000000000000000000000`, dummy token `10000000-aaaa-bbbb-cccc-000000000001`. Widget: `js.hcaptcha.com/1/api.js`. Verify: `api.hcaptcha.com/siteverify`.
+- **Arkose:** NO public dummy key. Public demo: `test.cap.guru/en/demo/funcap` (embed `iframe.arkoselabs.com`, key `EA4B65CB-594A-438E-B4B5-D0DBA28C9334`). Never hit a key you don't own outside the demo.
+- **AWS WAF:** no demo key; find a live target returning `x-amzn-waf-action: captcha` (officeworks.com.au proven, may change).
+
 ## Pitfalls
 
 - **Misidentifying the vendor is the #1 time sink.** A 403 with `geo.captcha-delivery.com` is DataDome, not Cloudflare; a 403 with no markers at all means no challenge exists. Use the triage table before touching a solver.

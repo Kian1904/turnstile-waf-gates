@@ -79,6 +79,20 @@ node scripts/probe_nodom.js                # DOM requirement proof
 | zillow.com | **PerimeterX Press&Hold** | correctly identified; behavioral challenge not solved |
 | reuters.com | **DataDome** | correctly identified; blocks CDP evaluation (hardest wall tested) |
 
+## Full-provider verdict matrix (2026-11-21)
+
+Five providers executed end-to-end, plus a datacenter-IP replication on an Instabox VM:
+
+| Provider | Termux (mobile IP) | Datacenter IP (VM) |
+|---|---|---|
+| Turnstile dummy keys | ✅ PASS | ✅ PASS (IP-agnostic) |
+| Turnstile interactive `3x…FF` | ❌ BLOCKED (`300030`) | ❌ BLOCKED |
+| hCaptcha test keys | ✅ FULL PASS | ✅ PASS |
+| AWS WAF CAPTCHA | ✅ PASS (puzzle solved via CDP) | — |
+| Arkose (cap.guru demo) | ❌ DENIED ACCESS `400` | ❌ BLOCKED EARLIER (`gt2` never sent) |
+
+**New finding:** Arkose's wall is **IP reputation first, environment second** — on a datacenter IP the `gt2` init request is killed before the challenge flow even starts. See SKILL.md §"Full-provider verdict matrix" for the full tables, the AWS WAF CAPTCHA solve pattern, and official test-key endpoints.
+
 ## License
 
 MIT
