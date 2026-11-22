@@ -1,0 +1,407 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""turnstile-solve — end-to-end Cloudflare Turnstile token solver over raw CDP.
+
+Zero dependencies (stdlib only). Designed for Termux/arm64 where patchright,
+playwright and camoufox have no wheels — but the architecture is portable:
+any Chromium reachable over CDP works (local or remote).
+
+The fingerprint-first doctrine (proven 2026-11-20 on production keys):
+  interactive-vs-non-interactive is NOT a sitekey property. Cloudflare grades
+  the browser process at birth. Launch with clean-fp-chrome, verify with
+  fp-audit, THEN solve. This tool refuses to run against a dirty browser.
+
+Usage:
+  turnstile-solve --url https://target.example/login [--port 9222] [--timeout 45]
+  turnstile-solve --sitekey 0x4AAA... --url https://target.example/ --blank-page
+  turnstile-solve --sitekey 1x00000000000000000000AA --blank-page   # official demo
+  turnstile-solve --url ... --click        # force interactive-click fallback
+  turnstile-solve --url ... --json         # machine-readable result
+
+Output (JSON on stdout, logs on stderr):
+  {"ok": true, "token": "0.xxx", "elapsed": 9.2, "mode": "auto-pass",
+   "sitekey": "...", "action": null, "cdata": null, "error_codes": []}
+
+Exit codes: 0 token obtained; 2 dirty fingerprint (relaunch browser);
+            3 timeout; 4 challenge error (codes in JSON); 5 usage/CDP failure.
+"""
+import argparse
+import base64
+import json
+import os
+import socket
+import struct
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+# ---------------------------------------------------------------- CDP client
+class CDP:
+    """Minimal CDP websocket client — no deps, event-aware."""
+
+    def __init__(self, ws_url, timeout=15):
+        u = urllib.parse.urlparse(ws_url)
+        self.sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        path = u.path + (f"?{u.query}" if u.query else "")
+        self.sock.sendall((
+            f"GET {path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
+            f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += self.sock.recv(4096)
+        if b"101" not in buf.split(b"\r\n")[0]:
+            raise ConnectionError("websocket upgrade refused: " + buf[:80].decode("replace"))
+        self._buf = buf.split(b"\r\n\r\n", 1)[1]
+        self._id = 0
+        self.events = []
+
+    def _send_frame(self, payload):
+        data = payload.encode()
+        mask = os.urandom(4)
+        header = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126); header += struct.pack(">H", n)
+        else:
+            header.append(0x80 | 127); header += struct.pack(">Q", n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(bytes(header) + mask + masked)
+
+    def _recv_frame(self, timeout):
+        self.sock.settimeout(timeout)
+        def read(n):
+            while len(self._buf) < n:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("CDP socket closed")
+                self._buf += chunk
+        read(2)
+        b2 = self._buf[1]
+        ln = b2 & 0x7F
+        off = 2
+        if ln == 126:
+            read(4); ln = struct.unpack(">H", self._buf[2:4])[0]; off = 4
+        elif ln == 127:
+            read(10); ln = struct.unpack(">Q", self._buf[2:10])[0]; off = 10
+        read(off + ln)
+        payload = self._buf[off:off + ln]
+        self._buf = self._buf[off + ln:]
+        return payload.decode("utf-8", "replace")
+
+    def call(self, method, params=None, timeout=15):
+        self._id += 1
+        mid = self._id
+        self._send_frame(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{method} timed out")
+            msg = json.loads(self._recv_frame(remaining))
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error']}")
+                return msg.get("result", {})
+            if "method" in msg:
+                self.events.append(msg)
+
+    def evaluate(self, expression, timeout=15):
+        r = self.call("Runtime.evaluate", {
+            "expression": expression, "returnByValue": True, "awaitPromise": True,
+        }, timeout=timeout)
+        res = r.get("result", {})
+        if r.get("exceptionDetails"):
+            raise RuntimeError("page eval threw: " + json.dumps(r["exceptionDetails"])[:200])
+        return res.get("value")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+# ---------------------------------------------------------------- helpers
+def http_json(base, path, method="GET"):
+    req = urllib.request.Request(base + path, method=method)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+def fingerprint_check(cdp):
+    """Refuse to solve on a dirty browser. Two hard signals Cloudflare grades."""
+    fp = cdp.evaluate(
+        "JSON.stringify({wd:navigator.webdriver,ua:navigator.userAgent,"
+        "plugins:navigator.plugins.length,chrome:!!window.chrome})")
+    fp = json.loads(fp)
+    hard_ok = fp["wd"] is False and "Headless" not in fp["ua"]
+    return hard_ok, fp
+
+# The page-side collector: mounts hooks for token, error codes, expiry.
+# Works for implicit render (existing widget) and explicit render (blank page).
+COLLECTOR_JS = r"""
+(() => {
+  if (window.__tsw) return 'already';
+  window.__tsw = {token: null, errors: [], expired: 0, ready: false};
+  // hook the response textarea/input via MutationObserver — implicit widgets
+  const grab = () => {
+    const el = document.querySelector('[name="cf-turnstile-response"], #cf-turnstile-response, [name="g-recaptcha-response"]');
+    if (el && el.value && el.value.length > 20) window.__tsw.token = el.value;
+  };
+  new MutationObserver(grab).observe(document.documentElement, {subtree: true, childList: true, attributes: true, attributeFilter: ['value']});
+  setInterval(grab, 500);
+  return 'hooked';
+})()
+"""
+
+EXPLICIT_RENDER_JS = r"""
+((sitekey, action, cdata) => {
+  window.__tsw = window.__tsw || {token: null, errors: [], expired: 0, ready: false};
+  const mount = () => {
+    const div = document.createElement('div');
+    div.id = '__tsw-container';
+    document.body.appendChild(div);
+    const opts = {
+      sitekey: sitekey,
+      callback: t => { window.__tsw.token = t; },
+      'error-callback': code => { window.__tsw.errors.push(String(code)); },
+      'expired-callback': () => { window.__tsw.expired++; window.__tsw.token = null; },
+      'timeout-callback': () => { window.__tsw.errors.push('timeout'); },
+    };
+    if (action) opts.action = action;
+    if (cdata) opts.cData = cdata;
+    try { window.turnstile.render('#__tsw-container', opts); window.__tsw.ready = true; }
+    catch (e) { window.__tsw.errors.push('render:' + e.message); }
+  };
+  if (window.turnstile && window.turnstile.render) { mount(); return 'rendered'; }
+  const s = document.createElement('script');
+  s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=__tswOnload';
+  window.__tswOnload = mount;
+  s.onerror = () => window.__tsw.errors.push('api-js-load-failed');
+  document.head.appendChild(s);
+  return 'loading';
+})(SITEKEY, ACTION, CDATA)
+"""
+
+STATE_JS = "JSON.stringify(window.__tsw || {missing: true})"
+
+# Widget geometry from the PARENT page (the OOPIF itself is unreachable via
+# Runtime.evaluate — attachToTarget routes back to the parent; verified twice).
+GEOMETRY_JS = r"""
+(() => {
+  const host = document.querySelector('.cf-turnstile, [data-sitekey], #__tsw-container, iframe[src*="challenges.cloudflare.com"]');
+  if (!host) return null;
+  let box = host.getBoundingClientRect();
+  const ifr = host.tagName === 'IFRAME' ? host : host.querySelector('iframe[src*="challenges.cloudflare.com"]');
+  if (ifr) box = ifr.getBoundingClientRect();
+  if (box.width === 0 || box.height === 0) return null;
+  return JSON.stringify({x: box.x, y: box.y, w: box.width, h: box.height});
+})()
+"""
+
+def click_checkbox(cdp, geometry):
+    """Trusted click on the checkbox slot inside the widget container.
+    Checkbox sits ~28px from the left edge, ~32px vertical center of a
+    standard 300x65 widget; state changes shift it ~14px — re-read geometry
+    before every attempt."""
+    g = json.loads(geometry)
+    # standard widget: checkbox left ~+28, center-y ~+32; compact/short boxes clamp
+    x = g["x"] + min(28, g["w"] * 0.12)
+    y = g["y"] + min(32, g["h"] * 0.5)
+    for typ in ("mousePressed", "mouseReleased"):
+        cdp.call("Input.dispatchMouseEvent", {
+            "type": typ, "x": x, "y": y, "button": "left",
+            "clickCount": 1, "buttons": 1 if typ == "mousePressed" else 0,
+        })
+    return x, y
+
+# ---------------------------------------------------------------- solver core
+def solve(args):
+    base = f"http://127.0.0.1:{args.port}"
+    t0 = time.monotonic()
+
+    # 1. find or create a page target
+    try:
+        targets = http_json(base, "/json/list")
+    except Exception as e:
+        return fail(5, f"no browser on :{args.port} — launch clean-fp-chrome first ({e})", t0)
+    page = next((t for t in targets if t["type"] == "page"), None)
+    if not page:
+        page = http_json(base, "/json/new?about:blank", method="PUT")
+
+    cdp = CDP(page["webSocketDebuggerUrl"])
+    try:
+        cdp.call("Page.enable")
+        cdp.call("Runtime.enable")
+
+        # 2. fingerprint gate — hard refuse on dirty browser
+        hard_ok, fp = fingerprint_check(cdp)
+        log(f"fingerprint: webdriver={fp['wd']} plugins={fp['plugins']} chrome={fp['chrome']}")
+        if not hard_ok and not args.force:
+            return fail(2, "DIRTY fingerprint — relaunch with clean-fp-chrome. "
+                           "Patching navigator on the parent page cannot fix the OOPIF.", t0, fp=fp)
+
+        # 3. navigate or blank-page render
+        if args.blank_page:
+            if not args.sitekey:
+                return fail(5, "--blank-page requires --sitekey", t0)
+            # blank page must carry the target's ORIGIN — the token is origin-bound.
+            # Route the real URL but serve our own minimal HTML via Fetch interception.
+            cdp.call("Fetch.enable", {"patterns": [
+                {"urlPattern": args.url, "requestStage": "Request", "resourceType": "Document"}]})
+            html = "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body></body></html>"
+            nav_started = False
+            # navigate async: send Page.navigate then service the paused request
+            cdp._id += 1
+            nav_id = cdp._id
+            cdp._send_frame(json.dumps({"id": nav_id, "method": "Page.navigate",
+                                        "params": {"url": args.url}}))
+            deadline = time.monotonic() + 15
+            fulfilled = False
+            while time.monotonic() < deadline and not fulfilled:
+                msg = json.loads(cdp._recv_frame(deadline - time.monotonic()))
+                if msg.get("method") == "Fetch.requestPaused":
+                    rid = msg["params"]["requestId"]
+                    cdp.call("Fetch.fulfillRequest", {
+                        "requestId": rid, "responseCode": 200,
+                        "responseHeaders": [{"name": "Content-Type", "value": "text/html"}],
+                        "body": base64.b64encode(html.encode()).decode(),
+                    })
+                    fulfilled = True
+                elif msg.get("id") == nav_id:
+                    nav_started = True
+            cdp.call("Fetch.disable")
+            if not fulfilled:
+                log("Fetch interception never fired — falling back to DOM injection")
+                cdp.call("Page.navigate", {"url": args.url})
+                time.sleep(2)
+                cdp.evaluate("document.body.innerHTML = ''; 'cleared'")
+            time.sleep(0.5)
+            render_js = (EXPLICIT_RENDER_JS
+                         .replace("SITEKEY", json.dumps(args.sitekey))
+                         .replace("ACTION", json.dumps(args.action))
+                         .replace("CDATA", json.dumps(args.cdata)))
+            log("blank-page render: " + str(cdp.evaluate(render_js)))
+        else:
+            log(f"navigating: {args.url}")
+            cdp.call("Page.navigate", {"url": args.url})
+            # NEVER Page.stopLoading / eager — it cancels the challenge script
+            time.sleep(args.settle)
+            cdp.evaluate(COLLECTOR_JS)
+            # extract the triple from the live page if not given
+            if not args.sitekey:
+                triple = cdp.evaluate(r"""
+                (() => {
+                  const div = document.querySelector('.cf-turnstile, [data-sitekey]');
+                  if (div) return JSON.stringify({sitekey: div.getAttribute('data-sitekey'),
+                    action: div.getAttribute('data-action'), cdata: div.getAttribute('data-cdata')});
+                  const m = document.documentElement.innerHTML.match(/turnstile\.render\([^,]+,\s*\{[^}]*sitekey\s*:\s*['"]([^'"]+)['"]/);
+                  return m ? JSON.stringify({sitekey: m[1], action: null, cdata: null}) : null;
+                })()""")
+                if triple:
+                    t = json.loads(triple)
+                    args.sitekey = t["sitekey"]; args.action = args.action or t["action"]; args.cdata = args.cdata or t["cdata"]
+                    log(f"extracted sitekey={args.sitekey} action={args.action} cdata={args.cdata}")
+                else:
+                    # SPA widgets mount AFTER our settle window — keep trying
+                    # inside the wait loop instead of giving up here.
+                    log("no widget yet — will re-scan during wait loop (SPA late-mount)")
+            # explicit-render pages: also hook error callbacks if turnstile API present
+            cdp.evaluate(r"""
+            (() => {
+              if (window.turnstile && !window.__tswErrors) {
+                window.__tswErrors = [];
+              }
+              return 'ok';
+            })()""")
+
+        # 4. wait for the token — auto-pass first, click only if needed
+        mode = "auto-pass"
+        clicked = 0
+        last_click = 0.0
+        deadline = time.monotonic() + args.timeout
+        state = {}
+        while time.monotonic() < deadline:
+            raw = cdp.evaluate(STATE_JS)
+            state = json.loads(raw) if raw else {}
+            # late-mount SPA widget: re-extract the triple once it appears
+            if not args.sitekey and not args.blank_page:
+                triple = cdp.evaluate(r"""
+                (() => {
+                  const div = document.querySelector('.cf-turnstile, [data-sitekey]');
+                  return div ? JSON.stringify({sitekey: div.getAttribute('data-sitekey'),
+                    action: div.getAttribute('data-action'), cdata: div.getAttribute('data-cdata')}) : null;
+                })()""")
+                if triple:
+                    t = json.loads(triple)
+                    args.sitekey = t["sitekey"]; args.action = args.action or t["action"]; args.cdata = args.cdata or t["cdata"]
+                    log(f"late-mount sitekey={args.sitekey}")
+            if state.get("token"):
+                return {
+                    "ok": True, "token": state["token"],
+                    "elapsed": round(time.monotonic() - t0, 2),
+                    "mode": mode, "clicks": clicked,
+                    "sitekey": args.sitekey, "action": args.action, "cdata": args.cdata,
+                    "error_codes": state.get("errors", []),
+                    "expired": state.get("expired", 0),
+                }
+            errs = state.get("errors", [])
+            if any(str(e).startswith("3000") or str(e).startswith("6000") for e in errs):
+                # hard client error — retrying clicks cannot fix these
+                return fail(4, f"challenge client error(s): {errs}", t0, error_codes=errs)
+            need_click = args.click or (time.monotonic() - t0 > args.auto_wait)
+            if need_click and time.monotonic() - last_click > args.click_cooldown:
+                geom = cdp.evaluate(GEOMETRY_JS)
+                if geom:
+                    x, y = click_checkbox(cdp, geom)
+                    clicked += 1; last_click = time.monotonic()
+                    mode = "interactive-click"
+                    log(f"click #{clicked} at ({x:.0f},{y:.0f})")
+            time.sleep(0.5)
+
+        return fail(3, f"no token within {args.timeout}s (clicks={clicked}, state={state})",
+                    t0, error_codes=state.get("errors", []), clicks=clicked)
+    finally:
+        cdp.close()
+
+def fail(code, message, t0, **extra):
+    out = {"ok": False, "exit_code": code, "error": message,
+           "elapsed": round(time.monotonic() - t0, 2)}
+    out.update(extra)
+    return out
+
+def main():
+    ap = argparse.ArgumentParser(description="Turnstile token solver over raw CDP (stdlib only)")
+    ap.add_argument("--url", required=True, help="target page URL (origin matters for the token)")
+    ap.add_argument("--sitekey", help="override/extract-bypass; required with --blank-page")
+    ap.add_argument("--action", help="widget action (inside the token, must match)")
+    ap.add_argument("--cdata", help="widget cData (inside the token, must match)")
+    ap.add_argument("--port", type=int, default=9222)
+    ap.add_argument("--timeout", type=float, default=45)
+    ap.add_argument("--auto-wait", type=float, default=12,
+                    help="seconds to wait for auto-pass before attempting clicks")
+    ap.add_argument("--click", action="store_true", help="click immediately (interactive widget)")
+    ap.add_argument("--click-cooldown", type=float, default=4)
+    ap.add_argument("--settle", type=float, default=3, help="page settle time after navigate")
+    ap.add_argument("--blank-page", action="store_true",
+                    help="render our own widget at the target origin (needs --sitekey)")
+    ap.add_argument("--force", action="store_true", help="skip fingerprint gate (will likely fail)")
+    ap.add_argument("--json", action="store_true", help="JSON only on stdout")
+    args = ap.parse_args()
+
+    result = solve(args)
+    print(json.dumps(result))
+    if not args.json:
+        if result["ok"]:
+            log(f"SOLVED in {result['elapsed']}s ({result['mode']}, {result.get('clicks', 0)} clicks)")
+        else:
+            log(f"FAILED: {result['error']}")
+    sys.exit(0 if result["ok"] else result.get("exit_code", 1))
+
+if __name__ == "__main__":
+    main()

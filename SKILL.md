@@ -212,6 +212,85 @@ Details, struct shapes and the captcha variant: `references/waf-solver-internals
 
 **Fingerprint is the wall, not crypto.** A correct token from an incomplete fingerprint still fails. Ship a real `webgl.json` and a UA whose `sec-ch-ua` matches it.
 
+## The solver toolchain (this repo ships working code, not just doctrine)
+
+Three tools, zero dependencies (Python stdlib + raw CDP websocket — no patchright,
+no playwright, no camoufox; those have no Termux/arm64 wheels):
+
+```
+clean-fp-chrome   → birth the browser with a clean fingerprint (the ONLY fix point)
+fp-audit          → prove the fingerprint is clean before wasting a solve attempt
+turnstile-solve   → end-to-end token solver: navigate / blank-page / click fallback
+solver-api.py     → local HTTP API (POST /solve, GET /health) in front of the solver
+```
+
+### turnstile-solve — CLI
+
+```bash
+# solve the widget on a live page (extracts sitekey/action/cData itself)
+scripts/turnstile-solve --url https://target.example/login
+
+# sitekey-only solve: render our own widget at the target's ORIGIN via
+# Fetch interception (token is origin-bound; a random blank page won't verify)
+scripts/turnstile-solve --url https://target.example/ --sitekey 0x4AAA... --blank-page
+
+# force interactive mode (skip the auto-pass grace window)
+scripts/turnstile-solve --url ... --click
+
+# machine-readable
+scripts/turnstile-solve --url ... --json
+```
+
+Behavior contract:
+
+- **Fingerprint gate first**: dirty browser (`webdriver=true` / UA `Headless`) → exit 2,
+  refuses to solve. `--force` overrides (will likely fail — that's the point).
+- **Auto-pass before clicks**: waits `--auto-wait` (default 12 s) for the non-interactive
+  token; only then attempts trusted `Input.dispatchMouseEvent` clicks with a cooldown.
+- **SPA late-mount**: if no widget at settle time, keeps re-scanning during the wait loop.
+- **Hard client errors abort**: `3000xx`/`6000xx` error-callback codes end the attempt —
+  click-looping cannot fix them (see error table below).
+- **Never `Page.stopLoading`** — cancels the challenge script.
+- Exit codes: `0` token, `2` dirty fingerprint, `3` timeout, `4` challenge client error,
+  `5` usage/CDP failure. JSON result on stdout, logs on stderr.
+
+Verified live (2026-11-22, Termux/arm64, Indonesian egress):
+
+| Target | Mode | Result |
+|---|---|---|
+| Cloudflare dummy `1x…AA`, blank-page | auto-pass | ✅ 4.2 s, 0 clicks |
+| 2captcha demo `3x…FF` (interactive) | interactive-click | ✅ 21.4 s, 3 clicks |
+| kenari.id/login (production key, SPA late-mount) | auto-pass | ✅ 15.6 s, 0 clicks, real `1.…` token |
+
+### solver-api.py — local HTTP API
+
+Same contract as the popular hosted solvers, minus the hosting and the fees:
+
+```bash
+scripts/solver-api.py --port 5000 --cdp-port 9222 &
+curl -s http://127.0.0.1:5000/health
+curl -s -X POST http://127.0.0.1:5000/solve -H 'content-type: application/json' \
+  -d '{"sitekey":"0x4AAA...","siteurl":"https://target.example/login","timeout":45}'
+# → {"status":"success","token":"0.…","elapsed":9.2,"mode":"auto-pass","error_codes":[]}
+```
+
+One shared browser, one solve at a time (lock + queue, `--max-queue`, 429 when full).
+Concurrent `Page.navigate` on one tab corrupts challenge state — this limit is honest,
+not a bug. For parallelism, run N browsers on N CDP ports and N API instances.
+
+### Turnstile client error codes (error-callback) — triage before retrying
+
+| Code | Meaning | Correct move |
+|---|---|---|
+| `300030` | generic invalid/unsupported client (often interactive key on a graded-down env, or blocked init) | check fingerprint + IP; retrying clicks is useless |
+| `3000xx` family | client-side init/config failure | fix environment, not the click loop |
+| `6000xx` family | challenge execution failure (network to CF, script killed) | check egress; never `Page.stopLoading` |
+| `110200` | invalid domain/sitekey pairing | the sitekey doesn't belong to this origin — extract, don't guess |
+| `timeout-callback` | widget gave up silently | `turnstile.reset()` and re-wait; then suspect IP reputation |
+
+Rule: an error code is a **verdict**, not a hint. `turnstile-solve` exits 4 on these
+instead of burning the timeout clicking a dead widget.
+
 ## reCAPTCHA (when it shows up in the same flow)
 
 - `v3` / `invisible` / `enterprise` are **score-based, no interaction**: render `api.js` (or `enterprise.js` → `grecaptcha.enterprise.execute`), call `execute(sitekey, {action})`, done in ~4 s. Score comes from browser fingerprint + IP.
