@@ -291,6 +291,67 @@ not a bug. For parallelism, run N browsers on N CDP ports and N API instances.
 Rule: an error code is a **verdict**, not a hint. `turnstile-solve` exits 4 on these
 instead of burning the timeout clicking a dead widget.
 
+## Vision-assisted tile loop (verified end-to-end on a local fixture)
+
+For tile-based visual challenges, the working shape is a **two-half loop** where the
+vision model never touches coordinates:
+
+```
+Page.captureScreenshot
+  → vision model reads the on-page prompt → returns tile INDICES (row-major, 0-8)
+  → scripts/tile-click --tiles <indices> --assert "<page verdict expr>"
+      (re-reads getBoundingClientRect before EVERY click — stale-coordinate proof)
+  → page's own verdict (window.__fixture.pass / server JSON) decides ok/fail
+```
+
+**Why indices, not pixels:** the vision model identifies *what* (fish, flower,
+tree — small failure surface); the geometry is read live from the DOM *where and
+how big* (immune to scroll, banners, re-renders). Mixing the two is how stale
+coordinate bugs are born.
+
+**Validated on the repo's own fixture** (`fixtures/tile-fixture/` — deterministic
+3x3 emoji grid, ground truth in-page, zero network, 2026-11-22):
+
+| Round | Vision answer | Clicks | Page verdict |
+|---|---|---|---|
+| 1 — fish & flower prompt | `[0,3,5,8]` | 4 | **PASS** |
+| 2 — adversarial: asked for trees | `[1,7]` | 2 | **FAIL — assert correctly false** |
+| 2b — same-session recovery | clear + `[0,3,5,8]` | 6 | **PASS** |
+
+Round 2 is the discipline proof: the mechanical half clicks whatever it is told,
+and the **page verdict catches the wrong selection**. Never claim a solve from
+"the clicks landed" — the assertion expression is the only exit-0 path.
+
+**Endpoint capability check first.** Whether the vision step works depends on the
+ACTIVE model's endpoint, not the tool: an endpoint that strips image content
+blocks makes `vision_analyze` answer "I don't have vision support in this session".
+That is an endpoint limitation — switch model or wire a separate vision HTTP API;
+do not retry the tool.
+
+Scope boundary unchanged: this loop is proven and executable on fixtures you own.
+Pointing it at a third party's production captcha is bypassing their access
+control — do not run it there; use human-in-the-loop for authorized targets.
+
+### pip packaging (v1.1.0)
+
+```bash
+pip install turnstile-waf-gates          # from PyPI once published, or:
+pip install git+https://github.com/Kian1904/turnstile-waf-gates.git
+# console scripts land on PATH:
+turnstile-solve --url https://target/login --json
+hcaptcha-solve  --url https://target/login
+awswaf-solve    --url https://target/
+batch-solve     urls.txt --workers 3
+python -m turnstile_waf_gates solve --url https://target/login   # module form
+```
+
+Zero runtime deps; `pip install "turnstile-waf-gates[awswaf]"` adds `cryptography`
+for the AWS WAF AES-256-GCM path. Packaging note learned the hard way: the old
+repo-root `setup.py` (installer helper) got imported by setuptools during builds
+and ran its "Platform: termux" banner mid-compile — renamed to `install.py`.
+One implementation lives in `scripts/`; entry points re-execute those files, so
+there is no scripts-vs-package drift.
+
 ## reCAPTCHA (when it shows up in the same flow)
 
 - `v3` / `invisible` / `enterprise` are **score-based, no interaction**: render `api.js` (or `enterprise.js` → `grecaptcha.enterprise.execute`), call `execute(sitekey, {action})`, done in ~4 s. Score comes from browser fingerprint + IP.

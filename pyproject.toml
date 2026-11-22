@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turnstile-waf-gates"
+version = "1.1.0"
+description = "Solve Cloudflare Turnstile, AWS WAF, and hCaptcha tokens — fingerprint-first, stdlib-only, Termux/arm64 proven. CLIs + local solver API."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Kian1904" }]
+keywords = ["turnstile", "cloudflare", "aws-waf", "hcaptcha", "captcha", "solver", "cdp", "anti-bot"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Android",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Security",
+]
+# Zero runtime dependencies — the whole point. `cryptography` is optional
+# (AWS WAF AES-256-GCM); users install it themselves if they need that path.
+dependencies = []
+
+[project.optional-dependencies]
+awswaf = ["cryptography>=42"]
+dev = []
+
+[project.urls]
+Homepage = "https://github.com/Kian1904/turnstile-waf-gates"
+Issues = "https://github.com/Kian1904/turnstile-waf-gates/issues"
+
+[project.scripts]
+turnstile-solve = "turnstile_waf_gates:main_turnstile_solve"
+hcaptcha-solve = "turnstile_waf_gates:main_hcaptcha_solve"
+awswaf-solve = "turnstile_waf_gates:main_awswaf_solve"
+batch-solve = "turnstile_waf_gates:main_batch_solve"
+parallel-solve = "turnstile_waf_gates:main_parallel_solve"
+solver-api = "turnstile_waf_gates:main_solver_api"
+tile-click = "turnstile_waf_gates:main_tile_click"
+clean-fp-chrome = "turnstile_waf_gates:main_clean_fp_chrome"
+fp-audit = "turnstile_waf_gates:main_fp_audit"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Ship scripts/ inside the wheel so a plain `pip install` works without the repo.
+[tool.setuptools.data-files]
+"share/turnstile_waf_gates/scripts" = [
+    "scripts/turnstile-solve",
+    "scripts/hcaptcha-solve",
+    "scripts/awswaf-solve",
+    "scripts/batch-solve",
+    "scripts/parallel-solve",
+    "scripts/solver-api.py",
+    "scripts/tile-click",
+    "scripts/clean-fp-chrome",
+    "scripts/fp-audit",
+    "scripts/test_solver_offline.py",
+    "scripts/test_turnstile_logic.py",
+    "scripts/test_replay_path.py",
+    "scripts/test_hcaptcha_logic.py",
+    "scripts/test_live_triage.py",
+]
+
+[tool.setuptools.package-data]
+turnstile_waf_gates = ["py.typed"]
