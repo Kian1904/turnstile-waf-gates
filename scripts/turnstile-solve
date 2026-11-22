@@ -152,6 +152,16 @@ COLLECTOR_JS = r"""
   const grab = () => {
     const el = document.querySelector('[name="cf-turnstile-response"], #cf-turnstile-response, [name="g-recaptcha-response"]');
     if (el && el.value && el.value.length > 20) window.__tsw.token = el.value;
+    // provider-generated response ids (e.g. cf-chl-widget-<id>_response on
+    // NopeCHA-style demos and some SPAs) — scan all inputs/textareas by pattern
+    if (!window.__tsw.token) {
+      const fields = document.querySelectorAll('input, textarea');
+      for (const f of fields) {
+        const k = (f.name || '') + ' ' + (f.id || '');
+        if (/cf-turnstile|cf-chl-widget.*response|g-recaptcha/i.test(k)
+            && f.value && f.value.length > 20) { window.__tsw.token = f.value; break; }
+      }
+    }
   };
   new MutationObserver(grab).observe(document.documentElement, {subtree: true, childList: true, attributes: true, attributeFilter: ['value']});
   setInterval(grab, 500);

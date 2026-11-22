@@ -1,0 +1,60 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""finish-solve — attach to an ALREADY-RENDERED widget and collect its token.
+
+Used when turnstile-solve timed out on CDP event load but the widget is live:
+mounts the collector hooks on the existing page, waits for the token, falls
+back to one trusted click. Same doctrine, minimal event loop.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+_loader = importlib.machinery.SourceFileLoader("tsolve", str(Path(__file__).resolve().parent / "turnstile-solve"))
+spec = importlib.util.spec_from_loader("tsolve", _loader)
+tsolve = importlib.util.module_from_spec(spec)
+_loader.exec_module(tsolve)
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9222
+TIMEOUT = float(sys.argv[2]) if len(sys.argv) > 2 else 40
+
+base = f"http://127.0.0.1:{PORT}"
+targets = json.loads(urllib.request.urlopen(base + "/json/list", timeout=5).read())
+page = next((t for t in targets if t["type"] == "page" and "chrome://" not in t["url"]), None)
+if not page:
+    print(json.dumps({"ok": False, "error": "no page target"}))
+    sys.exit(5)
+
+cdp = tsolve.CDP(page["webSocketDebuggerUrl"])
+cdp.call("Page.enable")
+cdp.call("Runtime.enable")
+print(f"attached: {page['url'][:70]}")
+
+# mount collector on the existing page
+print("hook:", cdp.evaluate(tsolve.COLLECTOR_JS))
+cdp.evaluate(tsolve.COLLECTOR_JS)
+
+t0 = time.monotonic()
+clicked = False
+while time.monotonic() - t0 < TIMEOUT:
+    state = json.loads(cdp.evaluate(tsolve.STATE_JS) or "{}")
+    if state.get("token"):
+        print(json.dumps({"ok": True, "token": state["token"][:60] + "...",
+                          "elapsed": round(time.monotonic() - t0, 2),
+                          "url": page["url"], "errors": state.get("errors", [])}))
+        cdp.close()
+        sys.exit(0)
+    if not clicked and time.monotonic() - t0 > 10:
+        geom = cdp.evaluate(tsolve.GEOMETRY_JS)
+        if geom:
+            xy = tsolve.click_checkbox(cdp, geom)
+            clicked = True
+            print(f"click at {xy}")
+    time.sleep(0.5)
+
+print(json.dumps({"ok": False, "error": "timeout", "state": state}))
+cdp.close()
+sys.exit(3)
