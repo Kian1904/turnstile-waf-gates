@@ -1,0 +1,31 @@
+# runtime fixtures — downloaded on demand, never committed
+scripts/api.js
+*.tar.gz
+repo.tar.gz
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# virtualenv / env
+.venv/
+venv/
+ENV/
+env/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# editor / temp
+*.swp
+*.swo
+*~
+.tmp*
