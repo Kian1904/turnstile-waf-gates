@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""batch-solve — solve Turnstile on multiple URLs sequentially.
+
+Reads a file of URLs (one per line) or accepts URLs on the command line.
+Runs turnstile-solve on each, collects results to JSON/CSV.
+
+One browser, one solve at a time — the same honest limit as solver-api.
+For true parallelism, run multiple browser instances on different CDP ports
+and split the URL list across them.
+
+Usage:
+  batch-solve urls.txt                        # from file
+  batch-solve --urls https://a.com/ https://b.com/   # inline
+  batch-solve urls.txt --output results.json --csv results.csv
+  batch-solve urls.txt --port 9222 --timeout 45
+
+Exit 0 if ALL solves succeed, 1 if any fail.
+"""
+import argparse
+import csv
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SOLVER = str(Path(__file__).resolve().parent / "turnstile-solve")
+
+
+def load_urls(args):
+    """Collect URLs from file and/or command line."""
+    urls = []
+    if args.file:
+        path = Path(args.file)
+        if not path.is_file():
+            print(f"ERROR: file not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        urls = [line.strip() for line in path.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+    if args.urls:
+        urls.extend(args.urls)
+    if not urls:
+        print("ERROR: no URLs provided. Use a file or --urls.", file=sys.stderr)
+        sys.exit(1)
+    return urls
+
+
+def solve_one(url, port, timeout):
+    """Run turnstile-solve on a single URL, return result dict."""
+    cmd = [sys.executable, SOLVER, "--url", url,
+           "--port", str(port), "--timeout", str(timeout), "--json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout + 30)
+        result = json.loads(proc.stdout.strip().splitlines()[-1])
+        result["url"] = url
+        return result
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "url": url, "error": "solver process timed out",
+                "exit_code": -1}
+    except Exception as e:
+        return {"ok": False, "url": url, "error": str(e), "exit_code": -1}
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Batch Turnstile solver — sequential, one browser")
+    ap.add_argument("file", nargs="?", help="file with URLs (one per line)")
+    ap.add_argument("--urls", nargs="+", help="inline URLs")
+    ap.add_argument("--port", type=int, default=9222)
+    ap.add_argument("--timeout", type=float, default=45)
+    ap.add_argument("--output", help="JSON results file")
+    ap.add_argument("--csv", help="CSV results file")
+    ap.add_argument("--delay", type=float, default=2.0,
+                    help="seconds between solves (avoid rate-limit)")
+    args = ap.parse_args()
+
+    urls = load_urls(args)
+    print(f"Loaded {len(urls)} URLs", file=sys.stderr)
+
+    results = []
+    passed = failed = 0
+    t0 = time.monotonic()
+
+    for i, url in enumerate(urls, 1):
+        print(f"[{i}/{len(urls)}] {url}", file=sys.stderr)
+        result = solve_one(url, args.port, args.timeout)
+        results.append(result)
+        if result.get("ok"):
+            passed += 1
+            print(f"  ✅ {result.get('elapsed', '?')}s ({result.get('mode', '?')})",
+                  file=sys.stderr)
+        else:
+            failed += 1
+            print(f"  ❌ {result.get('error', 'unknown')[:80]}",
+                  file=sys.stderr)
+        if i < len(urls):
+            time.sleep(args.delay)
+
+    elapsed = round(time.monotonic() - t0, 1)
+    summary = {
+        "total": len(urls), "passed": passed, "failed": failed,
+        "elapsed": elapsed,
+        "results": results,
+    }
+
+    # Output JSON
+    if args.output:
+        Path(args.output).write_text(json.dumps(summary, indent=2))
+        print(f"\nJSON results: {args.output}", file=sys.stderr)
+
+    # Output CSV
+    if args.csv:
+        with open(args.csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "url", "ok", "token", "elapsed", "mode", "sitekey",
+                "error_codes", "error"])
+            writer.writeheader()
+            for r in results:
+                writer.writerow({k: r.get(k, "") for k in writer.fieldnames})
+        print(f"CSV results: {args.csv}", file=sys.stderr)
+
+    print(f"\n{'='*50}", file=sys.stderr)
+    print(f"Batch complete: {passed}/{len(urls)} passed, "
+          f"{failed} failed in {elapsed}s", file=sys.stderr)
+    print(f"{'='*50}", file=sys.stderr)
+
+    sys.exit(0 if failed == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()
