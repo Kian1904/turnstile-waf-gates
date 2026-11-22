@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""tile-click — click grid tiles by index over CDP, then verify the page state.
+
+The vision half of a tile-captcha loop is the agent's job (screenshot ->
+vision_analyze -> index list). This script is the OTHER half, and it is the
+half that must be mechanically correct: map tile index -> live DOM geometry ->
+trusted Input.dispatchMouseEvent -> read back the page's own verdict.
+
+Why a separate tool: coordinates from a screenshot go stale the moment the
+page scrolls, a banner appears, or the grid re-renders. Reading
+getBoundingClientRect() immediately before each click is the only reliable
+mapping, and it keeps the vision step free of coordinate math (vision returns
+INDICES, not pixels — a much smaller failure surface).
+
+Usage:
+  tile-click --selector ".tile" --tiles 0,3,5,8
+  tile-click --selector ".tile" --tiles 0,3,5,8 --assert "window.__fixture.pass"
+  tile-click --selector ".tile" --tiles 1,7 --clear          # deselect first
+  tile-click --selector ".tile" --prompt-index               # ring tiles with index labels
+  tile-click --selector ".tile" --tiles 0,3 --port 9222 --json
+
+Index convention: row-major from the top-left tile (0 = top-left), matching
+how vision models read a grid.
+
+Exit codes: 0 asserted true (or no --assert), 1 assertion false, 5 CDP/usage failure.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+
+_here = Path(__file__).resolve().parent
+_loader = importlib.machinery.SourceFileLoader("tsolve", str(_here / "turnstile-solve"))
+_spec = importlib.util.spec_from_loader("tsolve", _loader)
+tsolve = importlib.util.module_from_spec(_spec)
+_loader.exec_module(tsolve)
+
+CDP = tsolve.CDP
+http_json = tsolve.http_json
+log = tsolve.log
+
+TILES_JS = r"""
+((sel) => {
+  const nodes = [...document.querySelectorAll(sel)];
+  return JSON.stringify(nodes.map((n, i) => {
+    const r = n.getBoundingClientRect();
+    return {
+      i: i,
+      x: Math.round(r.x), y: Math.round(r.y),
+      w: Math.round(r.width), h: Math.round(r.height),
+      text: (n.innerText || '').trim().slice(0, 40),
+      selected: n.classList.contains('selected') || n.getAttribute('aria-checked') === 'true'
+    };
+  }));
+})(SELECTOR)
+"""
+
+INDEX_LABELS_JS = r"""
+((sel) => {
+  document.querySelectorAll('.__tileidx').forEach(e => e.remove());
+  const nodes = [...document.querySelectorAll(sel)];
+  nodes.forEach((n, i) => {
+    const r = n.getBoundingClientRect();
+    const tag = document.createElement('div');
+    tag.className = '__tileidx';
+    tag.textContent = String(i);
+    tag.style.cssText = 'position:fixed;z-index:2147483647;background:#f0f;color:#fff;' +
+      'font:bold 13px monospace;padding:1px 4px;border-radius:3px;pointer-events:none;' +
+      'left:' + Math.round(r.x + 2) + 'px;top:' + Math.round(r.y + 2) + 'px';
+    document.body.appendChild(tag);
+  });
+  return String(nodes.length);
+})(SELECTOR)
+"""
+
+
+def get_tiles(cdp, selector):
+    return json.loads(cdp.evaluate(TILES_JS.replace("SELECTOR", json.dumps(selector))))
+
+
+def click_tile(cdp, tile):
+    cx = tile["x"] + tile["w"] // 2
+    cy = tile["y"] + tile["h"] // 2
+    for typ in ("mousePressed", "mouseReleased"):
+        cdp.call("Input.dispatchMouseEvent", {
+            "type": typ, "x": cx, "y": cy, "button": "left",
+            "clickCount": 1, "buttons": 1 if typ == "mousePressed" else 0,
+        })
+    return cx, cy
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Click grid tiles by index over CDP")
+    ap.add_argument("--selector", default=".tile", help="tile CSS selector")
+    ap.add_argument("--tiles", help="comma-separated tile indices to click (row-major)")
+    ap.add_argument("--clear", action="store_true",
+                    help="click any currently-selected tile first (deselect)")
+    ap.add_argument("--assert", dest="assert_expr",
+                    help="JS expression that must evaluate truthy (page's own verdict)")
+    ap.add_argument("--prompt-index", action="store_true",
+                    help="overlay index labels on the page (for the vision step)")
+    ap.add_argument("--port", type=int, default=9222)
+    ap.add_argument("--delay", type=float, default=0.25, help="seconds between clicks")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    out = {"ok": False}
+    try:
+        targets = http_json(f"http://127.0.0.1:{args.port}", "/json/list")
+    except Exception as e:
+        out["error"] = f"no browser on :{args.port} ({e})"
+        print(json.dumps(out))
+        sys.exit(5)
+
+    page = next((t for t in targets if t["type"] == "page" and "chrome://" not in t["url"]), None)
+    if not page:
+        page = next((t for t in targets if t["type"] == "page"), None)
+    if not page:
+        out["error"] = "no page target"
+        print(json.dumps(out))
+        sys.exit(5)
+
+    cdp = CDP(page["webSocketDebuggerUrl"])
+    try:
+        cdp.call("Page.enable")
+        cdp.call("Runtime.enable")
+        out["url"] = page["url"]
+
+        if args.prompt_index:
+            n = cdp.evaluate(INDEX_LABELS_JS.replace("SELECTOR", json.dumps(args.selector)))
+            out.update({"ok": True, "labeled": int(n), "mode": "label"})
+            print(json.dumps(out))
+            return
+
+        if args.clear:
+            selected = [t["i"] for t in get_tiles(cdp, args.selector) if t["selected"]]
+            for i in selected:
+                tiles = get_tiles(cdp, args.selector)   # re-read: geometry may shift
+                if i < len(tiles):
+                    click_tile(cdp, tiles[i])
+                    time.sleep(args.delay)
+            out["cleared"] = selected
+
+        clicked = []
+        if args.tiles:
+            wanted = [int(x) for x in args.tiles.replace(",", " ").split()]
+            for idx in wanted:
+                tiles = get_tiles(cdp, args.selector)   # ALWAYS re-read before clicking
+                if idx >= len(tiles):
+                    out["error"] = f"tile index {idx} out of range (found {len(tiles)})"
+                    print(json.dumps(out))
+                    sys.exit(1)
+                cx, cy = click_tile(cdp, tiles[idx])
+                clicked.append({"i": idx, "at": [cx, cy], "text": tiles[idx]["text"]})
+                time.sleep(args.delay)
+
+        out["clicked"] = clicked
+
+        final = get_tiles(cdp, args.selector)
+        out["selected"] = [t["i"] for t in final if t["selected"]]
+
+        verdict = None
+        if args.assert_expr:
+            verdict = cdp.evaluate(args.assert_expr)
+            out["verdict"] = verdict
+            out["ok"] = bool(verdict)
+        else:
+            out["ok"] = True
+
+        print(json.dumps(out))
+        sys.exit(0 if out["ok"] else 1)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        print(json.dumps(out))
+        sys.exit(5)
+    finally:
+        cdp.close()
+
+
+if __name__ == "__main__":
+    main()
