@@ -147,7 +147,7 @@ def fingerprint_check(cdp):
 COLLECTOR_JS = r"""
 (() => {
   if (window.__tsw) return 'already';
-  window.__tsw = {token: null, errors: [], expired: 0, ready: false};
+  window.__tsw = {token: null, errors: [], expired: 0, ready: false, pageErrors: []};
   // hook the response textarea/input via MutationObserver — implicit widgets
   const grab = () => {
     const el = document.querySelector('[name="cf-turnstile-response"], #cf-turnstile-response, [name="g-recaptcha-response"]');
@@ -162,9 +162,50 @@ COLLECTOR_JS = r"""
             && f.value && f.value.length > 20) { window.__tsw.token = f.value; break; }
       }
     }
+    // detect page-owned widgets that rendered empty (no iframe, no token)
+    // — Turnstile accepted the sitekey but refused to render the challenge.
+    // This happens on domain mismatch (400070) or broken pages.
+    // Only flag if widgets have been empty for >8s (give slow pages time to load).
+    if (!window.__tsw.token) {
+      const widgets = document.querySelectorAll('.cf-turnstile, [data-sitekey], .turnstile, [id^="example-container"]');
+      let empty = 0, total = 0;
+      for (const w of widgets) {
+        total++;
+        const iframe = w.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        const resp = w.querySelector('[name="cf-turnstile-response"], [id*="_response"]');
+        if (!iframe && (!resp || !resp.value || resp.value.length < 20)) empty++;
+      }
+      if (total > 0 && empty === total) {
+        if (!window.__tsw.emptySince) window.__tsw.emptySince = Date.now();
+        if (Date.now() - window.__tsw.emptySince > 8000) {
+          window.__tsw.pageErrors.push('empty-widgets:' + empty + '/' + total);
+        }
+      } else {
+        window.__tsw.emptySince = null;
+      }
+    }
   };
   new MutationObserver(grab).observe(document.documentElement, {subtree: true, childList: true, attributes: true, attributeFilter: ['value']});
   setInterval(grab, 500);
+  // Also: wrap window.turnstile.render to capture error-callback on the PAGE'S
+  // own widgets (not just ours). The page calls turnstile.render() with its own
+  // callbacks; we intercept by monkey-patching the API before the page's scripts run.
+  // This is best-effort — if the page already rendered, we can't retroactively
+  // capture. But the empty-widget detector above covers the common case.
+  if (window.turnstile && window.turnstile.render && !window.__tswWrapped) {
+    window.__tswWrapped = true;
+    const origRender = window.turnstile.render.bind(window.turnstile);
+    window.turnstile.render = function(container, opts) {
+      if (opts && typeof opts === 'object') {
+        const origErr = opts['error-callback'];
+        opts['error-callback'] = function(code) {
+          window.__tsw.pageErrors.push('page-error:' + code);
+          if (typeof origErr === 'function') origErr(code);
+        };
+      }
+      return origRender(container, opts);
+    };
+  }
   return 'hooked';
 })()
 """
@@ -361,6 +402,11 @@ def solve(args):
                     "expired": state.get("expired", 0),
                 }
             errs = state.get("errors", [])
+            page_errs = state.get("pageErrors", [])
+            # page-owned widget errors (400070 domain mismatch, empty widgets)
+            if page_errs:
+                return fail(4, f"page widget error(s): {page_errs}", t0,
+                            error_codes=errs, page_errors=page_errs)
             if any(str(e).startswith("3000") or str(e).startswith("6000") for e in errs):
                 # hard client error — retrying clicks cannot fix these
                 return fail(4, f"challenge client error(s): {errs}", t0, error_codes=errs)
@@ -375,7 +421,8 @@ def solve(args):
             time.sleep(0.5)
 
         return fail(3, f"no token within {args.timeout}s (clicks={clicked}, state={state})",
-                    t0, error_codes=state.get("errors", []), clicks=clicked)
+                    t0, error_codes=state.get("errors", []),
+                    page_errors=state.get("pageErrors", []), clicks=clicked)
     finally:
         cdp.close()
 
