@@ -37,6 +37,14 @@ PROFILE_NAME = "clean"
 BROWSER_BIN = None
 PROXY = None
 
+# Override PORT from --port flag
+for i, a in enumerate(sys.argv[1:]):
+    if a == "--port" and i + 1 < len(sys.argv[1:]):
+        try:
+            PORT = int(sys.argv[1:][i + 1])
+        except ValueError:
+            pass
+
 # Real Chrome UA — not HeadlessChrome. Cloudflare checks this.
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
@@ -241,8 +249,9 @@ def check_browser():
 def main():
     args = sys.argv[1:]
 
+    # If no args, spawn with defaults (profile-clean, port 9222)
     if not args:
-        print(__doc__)
+        spawn_browser()
         return
 
     if args[0] == "--kill":

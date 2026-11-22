@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""parallel-solve — N browsers, N workers, one URL list. True parallel batch solving.
+
+Spawns multiple clean-fp-chrome instances on different ports, splits the URL list
+across them, and collects all results into a single JSON/CSV.
+
+Each browser gets its own profile (independent fingerprint + cookies), so they
+don't interfere with each other. This is the practical parallelism ceiling on
+Termux/arm64 where async browser libraries have no wheels.
+
+Usage:
+  parallel-solve urls.txt --workers 3
+  parallel-solve urls.txt --workers 5 --timeout 45 --delay 2
+  parallel-solve --urls https://a.com/ https://b.com/ --workers 2
+  parallel-solve urls.txt --workers 3 --output results.json --csv results.csv
+
+Requirements: a clean browser binary (auto-detected by clean-fp-chrome).
+The script spawns and manages all browser instances automatically.
+"""
+import argparse
+import csv
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CLEAN_FC = str(HERE / "clean-fp-chrome")
+FP_AUDIT = str(HERE / "fp-audit")
+TURNSTILE_SOLVE = str(HERE / "turnstile-solve")
+BASE_PORT = 9222
+
+
+def load_urls(args):
+    """Collect URLs from file and/or inline."""
+    urls = []
+    if args.file:
+        path = Path(args.file)
+        if not path.is_file():
+            print(f"ERROR: file not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        urls = [line.strip() for line in path.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+    if args.urls:
+        urls.extend(args.urls)
+    if not urls:
+        print("ERROR: no URLs provided.", file=sys.stderr)
+        sys.exit(1)
+    return urls
+
+
+def spawn_browser(profile, port):
+    """Launch a clean-fp-chrome instance on the given port. Returns PID."""
+    cmd = [sys.executable, CLEAN_FC, "--profile", profile,
+           "--browser", find_browser(), "--port", str(port)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    # Wait for CDP to come up
+    import urllib.request
+    for _ in range(20):
+        time.sleep(0.5)
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=2) as r:
+                if b"Browser" in r.read():
+                    return proc
+        except Exception:
+            continue
+    return None
+
+
+def find_browser():
+    """Auto-detect browser binary (delegates to clean-fp-chrome logic)."""
+    # Import from clean-fp-chrome
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("cfp", CLEAN_FC)
+    spec = importlib.util.spec_from_loader("cfp", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    mod.BROWSER_BIN = None
+    return mod.find_browser()
+
+
+def kill_browser(port):
+    """Kill a browser on the given port."""
+    subprocess.run(["pkill", "-f", f"remote-debugging-port={port}"],
+                   capture_output=True, timeout=5)
+
+
+def solve_url(url, port, timeout):
+    """Run turnstile-solve on a single URL."""
+    cmd = [sys.executable, TURNSTILE_SOLVE, "--url", url,
+           "--port", str(port), "--timeout", str(timeout), "--json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout + 30)
+        result = json.loads(proc.stdout.strip().splitlines()[-1])
+        result["url"] = url
+        result["port"] = port
+        return result
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "url": url, "port": port,
+                "error": "solver timed out", "exit_code": -1}
+    except Exception as e:
+        return {"ok": False, "url": url, "port": port,
+                "error": str(e), "exit_code": -1}
+
+
+def worker(worker_id, urls, port, timeout, delay, results):
+    """Worker thread: spawn browser, solve URLs, collect results."""
+    profile = f"parallel-{worker_id}"
+    print(f"[w{worker_id}] spawning browser on :{port} (profile={profile})",
+          file=sys.stderr)
+
+    # Kill any existing browser on this port first (parallel-solve owns it)
+    kill_browser(port)
+    time.sleep(1)
+
+    browser = spawn_browser(profile, port)
+    if not browser:
+        print(f"[w{worker_id}] FAILED to spawn browser", file=sys.stderr)
+        for url in urls:
+            results.append({"ok": False, "url": url, "port": port,
+                            "error": "browser spawn failed"})
+        return
+
+    print(f"[w{worker_id}] browser UP on :{port}, "
+          f"{len(urls)} URLs assigned", file=sys.stderr)
+
+    for i, url in enumerate(urls):
+        print(f"[w{worker_id}] [{i+1}/{len(urls)}] {url}", file=sys.stderr)
+        result = solve_url(url, port, timeout)
+        results.append(result)
+        if result.get("ok"):
+            print(f"[w{worker_id}]   ✅ {result.get('elapsed', '?')}s "
+                  f"({result.get('mode', '?')})", file=sys.stderr)
+        else:
+            print(f"[w{worker_id}]   ❌ "
+                  f"{result.get('error', 'unknown')[:60]}", file=sys.stderr)
+        if i < len(urls) - 1:
+            time.sleep(delay)
+
+    # Cleanup this worker's browser
+    kill_browser(port)
+    print(f"[w{worker_id}] done, browser killed", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Parallel batch Turnstile solver — N browsers, N workers")
+    ap.add_argument("file", nargs="?", help="file with URLs (one per line)")
+    ap.add_argument("--urls", nargs="+", help="inline URLs")
+    ap.add_argument("--workers", type=int, default=3,
+                    help="number of parallel browser instances (default 3)")
+    ap.add_argument("--timeout", type=float, default=45,
+                    help="per-URL timeout in seconds")
+    ap.add_argument("--delay", type=float, default=2.0,
+                    help="seconds between solves per worker")
+    ap.add_argument("--output", help="JSON results file")
+    ap.add_argument("--csv", help="CSV results file")
+    args = ap.parse_args()
+
+    urls = load_urls(args)
+    n = args.workers
+    print(f"Loaded {len(urls)} URLs, {n} workers", file=sys.stderr)
+
+    # Split URLs across workers (round-robin for better load balancing)
+    batches = [[] for _ in range(n)]
+    for i, url in enumerate(urls):
+        batches[i % n].append(url)
+
+    # Remove empty batches
+    active_workers = [(i + 1, batch) for i, batch in enumerate(batches) if batch]
+    print(f"Active workers: {len(active_workers)} "
+          f"(batch sizes: {[len(b) for _, b in active_workers]})",
+          file=sys.stderr)
+
+    # Spawn workers in threads
+    import threading
+    results = []
+    threads = []
+    for worker_id, batch in active_workers:
+        port = BASE_PORT + worker_id - 1
+        t = threading.Thread(target=worker,
+                             args=(worker_id, batch, port, args.timeout,
+                                   args.delay, results))
+        t.start()
+        threads.append(t)
+
+    # Wait for all workers
+    for t in threads:
+        t.join()
+
+    # Cleanup any remaining browsers
+    for worker_id, _ in active_workers:
+        port = BASE_PORT + worker_id - 1
+        kill_browser(port)
+
+    # Collect results
+    passed = sum(1 for r in results if r.get("ok"))
+    failed = len(results) - passed
+
+    summary = {
+        "total": len(urls), "passed": passed, "failed": failed,
+        "workers": len(active_workers),
+        "results": results,
+    }
+
+    if args.output:
+        Path(args.output).write_text(json.dumps(summary, indent=2))
+        print(f"\nJSON: {args.output}", file=sys.stderr)
+
+    if args.csv:
+        with open(args.csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "url", "ok", "token", "elapsed", "mode", "sitekey",
+                "error_codes", "error", "port"])
+            writer.writeheader()
+            for r in results:
+                writer.writerow({k: r.get(k, "") for k in writer.fieldnames})
+        print(f"CSV:  {args.csv}", file=sys.stderr)
+
+    print(f"\n{'='*50}", file=sys.stderr)
+    print(f"Parallel batch complete: {passed}/{len(urls)} passed, "
+          f"{failed} failed ({len(active_workers)} workers)", file=sys.stderr)
+    print(f"{'='*50}", file=sys.stderr)
+
+    sys.exit(0 if failed == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()
