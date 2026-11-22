@@ -28,6 +28,7 @@ import re
 import string
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -313,6 +314,16 @@ def solve(args):
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             html = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # 403 is expected on WAF-protected pages — the WAF is blocking us.
+        # Read the body anyway; it often contains gokuProps or challenge.js.
+        try:
+            html = e.read().decode("utf-8", "replace")
+            log(f"HTTP {e.code} — reading body anyway (WAF challenge page)")
+        except Exception:
+            result = {"ok": False, "error": f"HTTP {e.code} and no body",
+                      "elapsed": round(time.monotonic() - t0, 2)}
+            return result
     except Exception as e:
         result = {"ok": False, "error": f"page fetch failed: {e}",
                   "elapsed": round(time.monotonic() - t0, 2)}

@@ -122,6 +122,25 @@ Five providers executed end-to-end, plus a datacenter-IP replication on an Insta
 
 **New finding:** Arkose's wall is **IP reputation first, environment second** — on a datacenter IP the `gt2` init request is killed before the challenge flow even starts. See SKILL.md §"Full-provider verdict matrix" for the full tables, the AWS WAF CAPTCHA solve pattern, and official test-key endpoints.
 
+## How this compares
+
+| | **turnstile-waf-gates** (this repo) | Theyka/Turnstile-Solver (986★) | cfsolve (888★) | EzSolver (161★) |
+|---|---|---|---|---|
+| **Dependencies** | stdlib only (zero pip) | patchright + camoufox | Rust + BoringSSL | Python + Chrome |
+| **Termux/arm64** | ✅ native | ❌ no wheels | ❌ Rust cross-compile hell | ✅ |
+| **Turnstile solve** | ✅ end-to-end CLI | ✅ + API server | ✅ request-based (no browser) | ✅ + API |
+| **AWS WAF** | ✅ CLI (PoW solver) | ❌ | ❌ | ❌ |
+| **Batch/Parallel** | ✅ batch + parallel scripts | ✅ async + multithread | ✅ library | ❌ single |
+| **Fingerprint doctrine** | ✅ fingerprint-first, OOPIF click, error-code triage | ❌ just click | ❌ | ❌ |
+| **Tests** | ✅ 71+ offline checks | ❌ none | ✅ CI | ❌ |
+| **API service** | ✅ POST /solve + health | ✅ | ❌ | ✅ |
+| **Cross-platform setup** | ✅ setup.py auto-detect | ❌ manual | ❌ cargo build | ❌ |
+| **License** | MIT | CC BY-NC 4.0 | — | — |
+
+The trade: Theyka/cfsolve are more mature (more stars, more battle-tested).
+This repo trades maturity for portability (zero deps, Termux-native) and
+documented doctrine (fingerprint-first, error-code triage, OOPIF mechanics).
+
 ## License
 
 MIT
