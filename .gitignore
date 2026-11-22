@@ -1,5 +1,6 @@
 # runtime fixtures — downloaded on demand, never committed
 scripts/api.js
+scripts/finish-solve
 *.tar.gz
 repo.tar.gz
 

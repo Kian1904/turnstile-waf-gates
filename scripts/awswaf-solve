@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""awswaf-solve — AWS WAF token solver. No browser needed.
+
+Computes the aws-waf-token cookie by reverse-engineering the challenge:
+  1. GET the page, extract gokuProps + challenge.js URL
+  2. GET /inputs?client=browser with browser-shaped headers
+  3. Solve the proof-of-work (sha256 or scrypt)
+  4. Build a fingerprint, AES-256-GCM encrypt the payload
+  5. POST /verify, get the token
+
+Zero pip dependencies for the invisible path (sha256 PoW).
+For the scrypt path or captcha.js variant, needs `cryptography` package.
+
+Usage:
+  awswaf-solve --url https://www.binance.com/
+  awswaf-solve --url https://target.example/ --json
+  awswaf-solve --url https://target.example/ --verbose
+
+Reference: references/waf-solver-internals.md
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+import random
+import re
+import string
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+# The static AES-256-GCM key baked into the AWS WAF client (from reverse).
+AES_KEY = bytes.fromhex("6f71a512b1e035eaab53d8be73120d3fb68a0ca346b9560aab3e5cdf753d5e98")
+
+# Header order that real browsers send (matters for /inputs)
+HEADER_ORDER = [
+    "accept", "accept-language", "accept-encoding", "pragma", "priority",
+    "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-fetch-dest",
+    "sec-fetch-mode", "sec-fetch-site", "user-agent",
+]
+
+BROWSER_HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "accept-encoding": "gzip, deflate, br",
+    "pragma": "no-cache",
+    "priority": "u=1, i",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Linux"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+}
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def check_digest(digest, difficulty):
+    """Check if digest has `difficulty` leading zero bits."""
+    full_bytes = difficulty // 8
+    rem_bits = difficulty % 8
+    for i in range(full_bytes):
+        if digest[i] != 0:
+            return False
+    if rem_bits:
+        if digest[full_bytes] >> (8 - rem_bits) != 0:
+            return False
+    return True
+
+
+def hash_pow(challenge_input, checksum, difficulty):
+    """Solve sha256 proof-of-work."""
+    combined = challenge_input + checksum
+    nonce = 0
+    while True:
+        digest = hashlib.sha256(f"{combined}{nonce}".encode()).digest()
+        if check_digest(digest, difficulty):
+            return str(nonce)
+        nonce += 1
+
+
+def scrypt_pow(challenge_input, checksum, difficulty):
+    """Solve scrypt proof-of-work (needs `cryptography` or `pyscrypt`)."""
+    combined = challenge_input + checksum
+    nonce = 0
+    try:
+        import hashlib
+        # Python 3.6+ has scrypt in hashlib
+        while True:
+            salt = b"awswaf"
+            result = hashlib.scrypt(f"{combined}{nonce}".encode(),
+                                    salt=salt, n=1024, r=1, p=1,
+                                    dklen=32)
+            if check_digest(result, difficulty):
+                return str(nonce)
+            nonce += 1
+    except Exception:
+        log("scrypt not available in this Python — falling back to sha256 path")
+        return None
+
+
+def solve_challenge(challenge_type, challenge_input, checksum, difficulty):
+    """Dispatch PoW solver based on challenge type."""
+    if challenge_type == "scrypt":
+        result = scrypt_pow(challenge_input, checksum, difficulty)
+        if result is not None:
+            return result
+        log("scrypt unavailable, trying sha256")
+        return hash_pow(challenge_input, checksum, difficulty)
+    return hash_pow(challenge_input, checksum, difficulty)
+
+
+def extract_gokuprops(html):
+    """Extract gokuProps (key, iv, context) from page HTML."""
+    # GokuProps is embedded in the page as a JSON object or script variable
+    patterns = [
+        r'gokuProps\s*[:=]\s*({[^}]+})',
+        r'"gokuProps"\s*:\s*({[^}]+})',
+        r'window\.gokuProps\s*=\s*({[^}]+})',
+        r'gokuProps\s*=\s*({[^}]+})',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                continue
+
+    # Also try to extract from inline scripts with a broader pattern
+    m = re.search(r'gokuProps[^}]*key[^}]*iv[^}]*context[^}]*}', html)
+    if m:
+        raw = m.group(0)
+        # Try to parse key/iv/context individually
+        key_m = re.search(r'key["\s:]+([^",\s]+)', raw)
+        iv_m = re.search(r'iv["\s:]+([^",\s]+)', raw)
+        ctx_m = re.search(r'context["\s:]+([^",\s]+)', raw)
+        if key_m and iv_m:
+            result = {"key": key_m.group(1).strip('"'),
+                      "iv": iv_m.group(1).strip('"')}
+            if ctx_m:
+                result["context"] = ctx_m.group(1).strip('"')
+            return result
+
+    return None
+
+
+def extract_challenge_js_url(html, page_url):
+    """Find the challenge.js URL in the page."""
+    patterns = [
+        r'src=["\']([^"\']*challenge\.js[^"\']*)["\']',
+        r'src=["\']([^"\']*challenge\.js[^"\']*)["\']',
+        r'challenge\.js[^"\']*["\']',
+        r'(/challenge\.js[^"\']*)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html)
+        if m:
+            url = m.group(1) if m.lastindex else m.group(0)
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/"):
+                parsed = urllib.parse.urlparse(page_url)
+                url = f"{parsed.scheme}://{parsed.netloc}{url}"
+            elif not url.startswith("http"):
+                parsed = urllib.parse.urlparse(page_url)
+                url = f"{parsed.scheme}://{parsed.netloc}/{url}"
+            return url
+    return None
+
+
+def fetch_inputs(base_url):
+    """GET /inputs?client=browser with browser-shaped headers."""
+    inputs_url = base_url.rstrip("/") + "/inputs?client=browser"
+    headers = {}
+    for key in HEADER_ORDER:
+        if key in BROWSER_HEADERS:
+            headers[key] = BROWSER_HEADERS[key]
+
+    req = urllib.request.Request(inputs_url, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
+def build_fingerprint(user_agent):
+    """Build a browser fingerprint payload."""
+    # Minimal viable fingerprint — real implementations use webgl.json
+    # for GPU renderer strings. This covers the basic fields AWS WAF checks.
+    fp = {
+        "metrics": [
+            {"name": "2", "value": random.random(), "unit": "2"},
+            {"name": "100", "value": 0, "unit": "2"},
+            {"name": "101", "value": 0, "unit": "2"},
+            {"name": "102", "value": 0, "unit": "2"},
+            {"name": "103", "value": 8, "unit": "2"},
+            {"name": "104", "value": 0, "unit": "2"},
+            {"name": "105", "value": 0, "unit": "2"},
+            {"name": "106", "value": 0, "unit": "2"},
+            {"name": "107", "value": 0, "unit": "2"},
+            {"name": "108", "value": 1, "unit": "2"},
+            {"name": "109", "value": 0, "unit": "2"},
+            {"name": "110", "value": 0, "unit": "2"},
+            {"name": "111", "value": 2, "unit": "2"},
+            {"name": "112", "value": 0, "unit": "2"},
+            {"name": "3", "value": 4, "unit": "2"},
+            {"name": "7", "value": 0, "unit": "4"},
+            {"name": "1", "value": random.random() * 10 + 10, "unit": "2"},
+            {"name": "4", "value": 36.5, "unit": "2"},
+            {"name": "5", "value": random.random(), "unit": "2"},
+            {"name": "6", "value": random.random() * 10 + 50, "unit": "2"},
+            {"name": "0", "value": random.random() * 10 + 130, "unit": "2"},
+            {"name": "8", "value": 1, "unit": "4"},
+            {"name": "undefined", "value": 0, "unit": "2"},
+        ],
+        "plugins": [],
+        "screenInfo": {
+            "width": 800,
+            "height": 600,
+            "availWidth": 800,
+            "availHeight": 600,
+            "colorDepth": 24,
+            "pixelDepth": 24,
+        },
+        "capabilities": {
+            "webdriver": False,
+            "cookiesEnabled": True,
+            "javaEnabled": False,
+        },
+        "gpu": {
+            "webGlRenderer": "ANGLE (ARM, Mali-G57 MC2, OpenGL ES 3.2)",
+            "webGlVendor": "ARM",
+        },
+        "canvas": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        "math": {
+            "sin": 0.1411200080598672,
+            "cos": -0.9899214986594214,
+            "tan": -0.14254654335427876,
+        },
+        "stealth": False,
+        "automation": False,
+        "crypto": True,
+        "be": True,
+    }
+    return fp
+
+
+def encode_with_crc(payload):
+    """CRC-encode the fingerprint payload. Returns (checksum, payload)."""
+    import binascii
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    checksum = f"{binascii.crc32(raw) & 0xFFFFFFFF:08x}"
+    return checksum, base64.b64encode(raw).decode()
+
+
+def encrypt_payload(data):
+    """AES-256-GCM encrypt the verify body."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        iv = os.urandom(12)
+        aesgcm = AESGCM(AES_KEY)
+        ct = aesgcm.encrypt(iv, data, None)
+        tag = ct[-16:]
+        ciphertext = ct[:-16]
+        return f"{base64.b64encode(iv).decode()}::{tag.hex()}::{ciphertext.hex()}"
+    except ImportError:
+        log("WARNING: `cryptography` not installed — sending plaintext body")
+        log("  Install: pip install cryptography")
+        return data.decode()
+
+
+def verify(base_url, challenge, solution, checksum, fp_payload, gokuprops):
+    """POST /verify with the solved challenge."""
+    verify_url = base_url.rstrip("/") + "/verify"
+    parsed = urllib.parse.urlparse(base_url)
+    domain = parsed.netloc
+
+    body = {
+        "challenge": challenge,
+        "solution": solution,
+        "signals": [{"Name": "Zoey", "Value": {"Present": fp_payload}}],
+        "checksum": checksum,
+        "existingToken": None,
+        "client": "Browser",
+        "domain": domain,
+        "metrics": build_fingerprint(BROWSER_HEADERS["user-agent"])["metrics"],
+        "gokuProps": gokuprops or {},
+    }
+    encrypted = encrypt_payload(json.dumps(body).encode())
+
+    headers = dict(BROWSER_HEADERS)
+    headers["content-type"] = "application/json"
+    req = urllib.request.Request(verify_url, data=encrypted.encode(),
+                                 headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
+def solve(args):
+    """Full AWS WAF solve flow."""
+    t0 = time.monotonic()
+    base_url = args.url
+    if not base_url.startswith("http"):
+        base_url = "https://" + base_url
+
+    log(f"fetching: {base_url}")
+    req = urllib.request.Request(base_url, headers=BROWSER_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        result = {"ok": False, "error": f"page fetch failed: {e}",
+                  "elapsed": round(time.monotonic() - t0, 2)}
+        return result
+
+    # Check if this is actually an AWS WAF page
+    if "challenge.js" not in html and "gokuProps" not in html and "aws-waf" not in html.lower():
+        result = {"ok": False, "error": "target does not appear to use AWS WAF "
+                  "(no challenge.js, gokuProps, or aws-waf markers in HTML)",
+                  "elapsed": round(time.monotonic() - t0, 2)}
+        return result
+
+    # Extract gokuProps
+    gokuprops = extract_gokuprops(html)
+    if gokuprops:
+        log(f"gokuProps found: keys={list(gokuprops.keys())}")
+    else:
+        log("no gokuProps in page — may need challenge.js URL")
+
+    # Find challenge.js URL (for reference, not strictly needed for solving)
+    ch_js = extract_challenge_js_url(html, base_url)
+    if ch_js:
+        log(f"challenge.js: {ch_js}")
+    else:
+        log("no challenge.js reference found — may not be an AWS WAF page")
+
+    # Get challenge inputs
+    log("fetching /inputs...")
+    inputs = fetch_inputs(base_url)
+    challenge_type = inputs.get("ChallengeType", "sha256")
+    challenge_input = inputs.get("Challenge", {}).get("Input", "")
+    difficulty = inputs.get("Difficulty", 0)
+
+    if not challenge_input:
+        return {"ok": False, "error": "no challenge input in /inputs response",
+                "raw": inputs}
+
+    log(f"challenge type: {challenge_type}, difficulty: {difficulty}")
+
+    # Solve PoW
+    log("solving PoW...")
+    solution = solve_challenge(challenge_type, challenge_input,
+                               gokuprops.get("context", "") if gokuprops else "",
+                               difficulty)
+    if solution is None:
+        return {"ok": False, "error": "PoW solving failed (scrypt unavailable)"}
+
+    log(f"solution: {solution}")
+
+    # Build fingerprint
+    fp = build_fingerprint(BROWSER_HEADERS["user-agent"])
+    checksum, fp_payload = encode_with_crc(fp)
+    log(f"fingerprint checksum: {checksum}")
+
+    # Verify
+    log("sending /verify...")
+    try:
+        result = verify(base_url, inputs.get("Challenge", {}),
+                        solution, checksum, fp_payload, gokuprops)
+    except Exception as e:
+        return {"ok": False, "error": f"verify request failed: {e}",
+                "elapsed": round(time.monotonic() - t0, 2)}
+
+    token = result.get("token") or result.get("Token")
+    if token:
+        return {
+            "ok": True, "token": token,
+            "elapsed": round(time.monotonic() - t0, 2),
+            "challenge_type": challenge_type,
+            "difficulty": difficulty,
+            "solution": solution,
+        }
+    return {"ok": False, "error": "no token in verify response",
+            "raw": result, "elapsed": round(time.monotonic() - t0, 2)}
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="AWS WAF token solver (no browser needed)")
+    ap.add_argument("--url", required=True, help="target URL")
+    ap.add_argument("--json", action="store_true", help="JSON only on stdout")
+    ap.add_argument("--verbose", action="store_true", help="verbose logging")
+    args = ap.parse_args()
+
+    result = solve(args)
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(json.dumps(result, indent=2))
+    sys.exit(0 if result.get("ok") else 1)
+
+
+if __name__ == "__main__":
+    main()

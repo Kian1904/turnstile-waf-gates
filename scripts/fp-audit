@@ -1,5 +1,7 @@
-#!/data/data/com.termux/files/usr/bin/python3
+#!/usr/bin/env python3
 """fp-audit — verify the running browser's anti-bot fingerprint via CDP websocket.
+
+Zero dependencies (stdlib only). Works on any CDP-reachable Chromium.
 
 Checks the exact signals Cloudflare reads:
   navigator.webdriver  must be false
@@ -10,26 +12,25 @@ Exit 0 only if webdriver=false and UA clean (the two hard-fail signals).
 
 Usage: fp-audit [port]
 """
+import base64
 import json
+import os
 import socket
 import struct
 import sys
-import urllib.parse  # noqa: E402
+import urllib.parse
 import urllib.request
 
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 9222
 base = f"http://127.0.0.1:{port}"
 
 
-def http_json(path, method="GET", body=None):
-    req = urllib.request.Request(base + path, method=method,
-                                 data=json.dumps(body).encode() if body else None,
-                                 headers={"content-type": "application/json"})
+def http_json(path, method="GET"):
+    req = urllib.request.Request(base + path, method=method)
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
 
 
-# --- get the page target + its websocket debugger URL ---
 targets = http_json("/json/list")
 page = next((t for t in targets if t["type"] == "page"), None)
 if not page:
@@ -37,12 +38,14 @@ if not page:
     sys.exit(1)
 ws_url = page["webSocketDebuggerUrl"]
 
-# --- minimal websocket client (no deps) ---
+
 class WS:
+    """Minimal CDP websocket client — no deps."""
+
     def __init__(self, url):
         u = urllib.parse.urlparse(url)
         self.sock = socket.create_connection((u.hostname, u.port), timeout=10)
-        key = __import__("base64").b64encode(__import__("os").urandom(16)).decode()
+        key = base64.b64encode(os.urandom(16)).decode()
         path = u.path + (f"?{u.query}" if u.query else "")
         self.sock.sendall((
             f"GET {path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
@@ -52,17 +55,19 @@ class WS:
         while b"\r\n\r\n" not in buf:
             buf += self.sock.recv(4096)
 
-    def send(self, payload: str):
+    def send(self, payload):
         data = payload.encode()
-        mask = __import__("os").urandom(4)
+        mask = os.urandom(4)
         header = bytearray([0x81])
         n = len(data)
         if n < 126:
             header.append(0x80 | n)
         elif n < 65536:
-            header.append(0x80 | 126); header += struct.pack(">H", n)
+            header.append(0x80 | 126)
+            header += struct.pack(">H", n)
         else:
-            header.append(0x80 | 127); header += struct.pack(">Q", n)
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", n)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
         self.sock.sendall(bytes(header) + mask + masked)
 
@@ -83,21 +88,23 @@ class WS:
         ln = b2 & 0x7F
         off = 2
         if ln == 126:
-            read(2); ln = struct.unpack(">H", buf[2:4])[0]; off = 4
+            read(2)
+            ln = struct.unpack(">H", buf[2:4])[0]
+            off = 4
         elif ln == 127:
-            read(8); ln = struct.unpack(">Q", buf[2:10])[0]; off = 10
+            read(8)
+            ln = struct.unpack(">Q", buf[2:10])[0]
+            off = 10
         read(off + ln)
         return buf[off:off + ln].decode("utf-8", "replace")
 
 
-import urllib.parse  # already imported at top  # noqa: F401
 ws = WS(ws_url)
 expr = ("JSON.stringify({wd:navigator.webdriver, ua:navigator.userAgent,"
         "plugins:navigator.plugins.length, chrome:!!window.chrome, "
         "langs:navigator.languages, hw:navigator.hardwareConcurrency})")
 ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
                     "params": {"expression": expr, "returnByValue": True}}))
-# read frames until our id=1 result
 result = None
 for _ in range(20):
     try:

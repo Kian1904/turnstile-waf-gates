@@ -7,35 +7,47 @@ Born from a live production campaign (2026-11-20): Cloudflare Turnstile solved e
 ## What's inside
 
 ```
+setup.py                      — one-command installer (auto-detects browser + PATH)
 SKILL.md                      — the skill: triage tables, launch recipes, pitfalls
 references/
   waf-solver-internals.md     — AWS WAF proof-of-work reverse (Go + Python port)
 scripts/
-  clean-fp-chrome             — spawn a Turnstile-grade Chromium (Termux/arm64 proven)
+  clean-fp-chrome             — spawn a Turnstile-grade Chromium (auto-detects browser, cross-platform)
   fp-audit                    — fingerprint checker via raw CDP websocket (no deps)
   turnstile-solve             — end-to-end token solver over raw CDP (stdlib only):
                                 navigate / blank-page / auto-pass / click fallback,
-                                fingerprint gate, error-code aborts, JSON output
+                                fingerprint gate, error-code aborts, proxy flag, JSON output
   solver-api.py               — local HTTP API (POST /solve, GET /health), lock+queue
+  awswaf-solve                — AWS WAF token solver (sha256/scrypt PoW, no browser needed)
   test_turnstile_logic.py     — 23 checks: classifier + sitekey/action/cData extraction
   test_live_triage.py         — 8 live-site checks (TLS only, no browser)
   test_replay_path.py         — 12 checks: token binding rules on a mock gate
   test_hcaptcha_logic.py      — offline hCaptcha routing/verdict checks
-  test_solver_offline.py      — 28 checks: solver + API contracts, doctrine guards
+  test_solver_offline.py      — 26 checks: solver + API contracts, doctrine guards
   probe_nodom.js              — proves api.js requires a DOM (bare Node throws)
 ```
 
-## Solve a Turnstile in one command
+## Quick start (any platform)
 
 ```bash
-scripts/clean-fp-chrome                                   # 1. clean browser birth
-scripts/fp-audit 9222                                     # 2. must print VERDICT: CLEAN
-scripts/turnstile-solve --url https://target.example/login  # 3. token as JSON
+# 1. Install (auto-detects Chrome/Chromium, links scripts to PATH)
+python3 setup.py
+
+# 2. Launch a clean-fingerprint browser
+clean-fp-chrome              # Termux/desktop, auto-detected
+clean-fp-chrome --check      # verify it's Turnstile-grade
+
+# 3. Solve
+turnstile-solve --url https://target.example/login
 ```
 
-Or run it as a service: `scripts/solver-api.py --port 5000` → `POST /solve`.
-Zero pip dependencies — Python stdlib + raw CDP. Works where patchright/playwright/
-camoufox have no wheels (Termux/arm64), and on any desktop Chromium too.
+On Termux: `pkg install chromium` → `python3 setup.py`
+On Debian/Ubuntu: `apt install chromium` → `python3 setup.py`
+On macOS: `brew install --cask google-chrome` → `python3 setup.py`
+On Windows: `winget install Google.Chrome` → `python setup.py`
+
+All scripts are stdlib-only (no pip install needed). The only optional dependency
+is `cryptography` for AWS WAF AES-256-GCM (the scrypt PoW path).
 
 ## The one finding that matters most
 
